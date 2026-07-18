@@ -1,0 +1,46 @@
+# .NET build output
+**/bin/
+**/obj/
+/packages/
+artifacts/
+
+# IDE and user-specific files
+.vs/
+.idea/
+*.user
+*.suo
+*.userosscache
+*.sln.docstates
+*.DotSettings.user
+riderModule.iml
+_ReSharper.Caches/
+
+# Tests and coverage
+TestResults/
+coverage/
+coverage.*
+*.trx
+
+# Runtime logs and temporary files
+Logs/
+*.log
+*.tmp
+*.temp
+
+# Local databases
+*.db
+*.db-shm
+*.db-wal
+*.mdf
+*.ldf
+
+# Local configuration and secrets
+appsettings.Local.json
+appsettings.*.Local.json
+.env
+.env.*
+!.env.example
+
+# OS files
+.DS_Store
+Thumbs.db

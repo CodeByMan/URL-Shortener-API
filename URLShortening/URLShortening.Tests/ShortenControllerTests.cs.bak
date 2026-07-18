@@ -1,0 +1,520 @@
+using System.ComponentModel.DataAnnotations;
+using System.Net;
+using System.Security.Claims;
+using AutoMapper;
+using Microsoft.AspNetCore.Http;
+using Microsoft.AspNetCore.Identity;
+using Microsoft.AspNetCore.Mvc;
+using Microsoft.EntityFrameworkCore;
+using URLShortening.AutoMapper;
+using URLShortening.Controllers;
+using URLShortening.Data;
+using URLShortening.Data.Repository;
+using URLShortening.DTOs;
+using URLShortening.Helpers;
+using URLShortening.Models;
+
+namespace URLShortening.Tests;
+
+public class ShortenControllerTests
+{
+    [Fact]
+    public async Task PublicRedirect_LogsAccessAndReturnsTemporaryRedirect()
+    {
+        var url = CreateUrl("abc12345", "https://example.com");
+        var repository = new FakeUrlRepository(url);
+        var accessLogRepository = new FakeAccessLogRepository();
+        var controller = CreateController(repository,
+            accessLogRepository: accessLogRepository);
+        controller.HttpContext.Connection.RemoteIpAddress =
+            IPAddress.Parse("203.0.113.10");
+        controller.HttpContext.Request.Headers["Referer"] =
+            "https://referrer.example/page";
+        controller.HttpContext.Request.Headers["User-Agent"] = "Test Agent";
+
+        var result = await controller.Get(url.ShortId);
+
+        var redirect = Assert.IsType<RedirectResult>(result);
+        Assert.Equal(url.LongUrl, redirect.Url);
+        Assert.False(redirect.Permanent);
+        var accessLog = Assert.Single(accessLogRepository.Logs);
+        Assert.Equal("203.0.113.10", accessLog.IPAddress);
+        Assert.Equal(url.Id, accessLog.UrlId);
+        Assert.Empty(url.AccessLogs);
+        Assert.Equal(0, repository.UpdateCount);
+        Assert.Equal(1, repository.RedirectLookupCount);
+    }
+
+    [Fact]
+    public async Task PublicRedirect_ReturnsNotFoundForExpiredLink()
+    {
+        var url = CreateUrl("expired1", "https://example.com");
+        url.ExpiresAt = DateTime.Now.AddMinutes(-1);
+        var controller = CreateController(new FakeUrlRepository(url));
+
+        var result = await controller.Get(url.ShortId);
+
+        Assert.IsType<NotFoundResult>(result);
+        Assert.Empty(url.AccessLogs);
+    }
+
+    [Fact]
+    public async Task PublicRedirect_ReturnsNotFoundForMissingShortCode()
+    {
+        var controller = CreateController(new FakeUrlRepository());
+
+        var result = await controller.Get("missing1");
+
+        Assert.IsType<NotFoundResult>(result);
+    }
+
+    [Fact]
+    public async Task ShortCodeGeneration_RetriesCollision()
+    {
+        var repository = new FakeUrlRepository();
+        repository.ExistingShortIds.Add("duplicate");
+        var controller = CreateController(repository,
+            generatedIds: ["duplicate", "unique12"]);
+
+        var result = await controller.Post(new UrlRequestDto
+        {
+            Url = "https://example.com"
+        });
+
+        Assert.IsType<CreatedResult>(result);
+        Assert.Equal("unique12", repository.AddedUrl?.ShortId);
+    }
+
+    [Fact]
+    public async Task AnonymousCreation_CreatesUnmanagedLink()
+    {
+        var repository = new FakeUrlRepository();
+        var user = new User
+        {
+            Email = "owner@example.com",
+            UserName = "owner@example.com"
+        };
+        var helper = new FakeUserHelper(user);
+        var controller = CreateController(repository,
+            userHelper: helper,
+            generatedIds: ["anon1234"]);
+
+        await controller.Post(new UrlRequestDto
+        {
+            Url = "https://example.com/anonymous"
+        });
+
+        Assert.NotNull(repository.AddedUrl);
+        Assert.Empty(user.Urls);
+        Assert.Equal(0, helper.UpdateCount);
+    }
+
+    [Fact]
+    public async Task Details_ReturnsOwnedUrl()
+    {
+        var url = CreateUrl("owned001", "https://example.com/owned");
+        var user = CreateUser("owner@example.com", url);
+        var controller = CreateController(new FakeUrlRepository(url), user);
+
+        var result = await controller.GetDetails(url.ShortId);
+
+        var ok = Assert.IsType<OkObjectResult>(result);
+        var dto = Assert.IsType<urlDto>(ok.Value);
+        Assert.Equal(url.ShortId, dto.ShortCode);
+    }
+
+    [Fact]
+    public async Task TwoUsers_CanShortenTheSameDestination()
+    {
+        var repository = new FakeUrlRepository();
+        var firstUser = CreateUser("first@example.com");
+        var secondUser = CreateUser("second@example.com");
+        var firstController = CreateController(repository, firstUser,
+            generatedIds: ["first001"]);
+        var secondController = CreateController(repository, secondUser,
+            generatedIds: ["second01"]);
+
+        await firstController.Post(new UrlRequestDto
+        {
+            Url = "https://example.com/shared"
+        });
+        await secondController.Post(new UrlRequestDto
+        {
+            Url = "https://example.com/shared"
+        });
+
+        Assert.Equal(2, repository.Urls.Count(url =>
+            url.LongUrl == "https://example.com/shared"));
+        Assert.Single(firstUser.Urls);
+        Assert.Single(secondUser.Urls);
+    }
+
+    [Fact]
+    public async Task Update_ReturnsNotFoundWhenUserDoesNotOwnUrl()
+    {
+        var url = CreateUrl("private1", "https://example.com/private");
+        var user = CreateUser("owner@example.com");
+        var controller = CreateController(new FakeUrlRepository(url), user);
+
+        var result = await controller.Update(new updateUrlDto
+        {
+            ShortCode = url.ShortId,
+            ExpiresAt = DateTime.Now.AddDays(1)
+        });
+
+        Assert.IsType<NotFoundResult>(result);
+    }
+
+    [Fact]
+    public async Task Delete_ReturnsNotFoundWhenUserDoesNotOwnUrl()
+    {
+        var url = CreateUrl("private2", "https://example.com/private");
+        var user = CreateUser("owner@example.com");
+        var controller = CreateController(new FakeUrlRepository(url), user);
+
+        var result = await controller.Delete(url.ShortId);
+
+        Assert.IsType<NotFoundResult>(result);
+    }
+
+    [Fact]
+    public async Task Analytics_ReturnsNotFoundWhenUserDoesNotOwnUrl()
+    {
+        var url = CreateUrl("private3", "https://example.com/private");
+        var user = CreateUser("owner@example.com");
+        var controller = CreateController(new FakeUrlRepository(url), user);
+
+        var result = await controller.GetStats(url.ShortId);
+
+        Assert.IsType<NotFoundResult>(result);
+    }
+
+    [Fact]
+    public async Task Analytics_HandlesNullAndMalformedReferrers()
+    {
+        var url = CreateUrl("stats001", "https://example.com/stats");
+        url.AccessLogs.Add(new AccessLog
+        {
+            Ref = null,
+            UserAgent = string.Empty,
+            AccessedAt = DateTime.Now
+        });
+        url.AccessLogs.Add(new AccessLog
+        {
+            Ref = "not a valid uri",
+            UserAgent = "Test Agent",
+            AccessedAt = DateTime.Now
+        });
+        var user = CreateUser("owner@example.com", url);
+        var controller = CreateController(new FakeUrlRepository(url), user,
+            geoHelper: new NullGeoHelper());
+
+        var result = await controller.GetStats(url.ShortId);
+
+        Assert.IsType<OkObjectResult>(result);
+    }
+
+    [Fact]
+    public async Task GeolocationFailure_DoesNotInterruptAnalytics()
+    {
+        var url = CreateUrl("stats002", "https://example.com/stats");
+        url.AccessLogs.Add(new AccessLog
+        {
+            IPAddress = "8.8.8.8",
+            UserAgent = "Test Agent",
+            AccessedAt = DateTime.Now
+        });
+        var user = CreateUser("owner@example.com", url);
+        var controller = CreateController(new FakeUrlRepository(url), user,
+            geoHelper: new NullGeoHelper());
+
+        var result = await controller.GetStats(url.ShortId);
+
+        Assert.IsType<OkObjectResult>(result);
+    }
+
+    [Fact]
+    public async Task RawForwardedHeader_IsNotTrustedByController()
+    {
+        var url = CreateUrl("proxy001", "https://example.com");
+        var controller = CreateController(new FakeUrlRepository(url));
+        controller.HttpContext.Connection.RemoteIpAddress = IPAddress.Loopback;
+        controller.HttpContext.Request.Headers["X-Forwarded-For"] = "8.8.8.8";
+
+        await controller.Get(url.ShortId);
+
+        Assert.Equal("127.0.0.1", url.AccessLogs.Single().IPAddress);
+    }
+
+    [Fact]
+    public async Task Put_ReturnsConflictWhenDestinationIsNotUniqueForUser()
+    {
+        var first = CreateUrl("same0001", "https://example.com/shared");
+        var second = CreateUrl("same0002", "https://example.com/shared");
+        var user = CreateUser("owner@example.com", first, second);
+        var controller = CreateController(
+            new FakeUrlRepository(first, second), user);
+
+        var result = await controller.Put(new UrlRequestDto
+        {
+            Url = "https://example.com/shared"
+        });
+
+        Assert.IsType<ConflictObjectResult>(result);
+    }
+
+    [Fact]
+    public void UrlRequestDto_RejectsUrlsLongerThanDatabaseColumn()
+    {
+        var dto = new UrlRequestDto
+        {
+            Url = "https://example.com/" + new string('a', 450)
+        };
+        var validationResults = new List<ValidationResult>();
+
+        var isValid = Validator.TryValidateObject(dto,
+            new ValidationContext(dto),
+            validationResults,
+            validateAllProperties: true);
+
+        Assert.False(isValid);
+        Assert.Contains(validationResults, result =>
+            result.MemberNames.Contains(nameof(UrlRequestDto.Url)));
+    }
+
+    [Fact]
+    public void DataModel_AllowsDuplicateLongUrlsButKeepsShortCodeUnique()
+    {
+        var options = new DbContextOptionsBuilder<DataContext>()
+            .UseSqlServer("Server=(localdb)\\MSSQLLocalDB;Database=ModelOnly;")
+            .Options;
+        using var context = new DataContext(options);
+        var entity = context.Model.FindEntityType(typeof(Url));
+        Assert.NotNull(entity);
+
+        var longUrlIndex = entity!.GetIndexes().Single(index =>
+            index.Properties.Single().Name == nameof(Url.LongUrl));
+        var shortCodeIndex = entity.GetIndexes().Single(index =>
+            index.Properties.Single().Name == nameof(Url.ShortId));
+
+        Assert.False(longUrlIndex.IsUnique);
+        Assert.True(shortCodeIndex.IsUnique);
+    }
+
+    private static TestShortenController CreateController(
+        FakeUrlRepository repository,
+        User? authenticatedUser = null,
+        FakeUserHelper? userHelper = null,
+        IGeoHelper? geoHelper = null,
+        IEnumerable<string>? generatedIds = null,
+        FakeAccessLogRepository? accessLogRepository = null)
+    {
+        userHelper ??= new FakeUserHelper(authenticatedUser);
+        var mapper = new MapperConfiguration(configuration =>
+            configuration.AddProfile<UrlMappingProfile>()).CreateMapper();
+        var controller = new TestShortenController(
+            userHelper,
+            repository,
+            accessLogRepository ?? new FakeAccessLogRepository(),
+            new DeviceInfoHelper(),
+            geoHelper ?? new NullGeoHelper(),
+            mapper,
+            generatedIds ?? ["test1234"]);
+
+        var httpContext = new DefaultHttpContext();
+        if (authenticatedUser?.Email != null)
+        {
+            httpContext.User = new ClaimsPrincipal(new ClaimsIdentity(
+            [
+                new Claim(ClaimTypes.Email, authenticatedUser.Email)
+            ], "Test"));
+        }
+
+        controller.ControllerContext = new ControllerContext
+        {
+            HttpContext = httpContext
+        };
+        return controller;
+    }
+
+    private static Url CreateUrl(string shortId, string longUrl)
+    {
+        return new Url
+        {
+            Id = Guid.NewGuid().ToString(),
+            ShortId = shortId,
+            LongUrl = longUrl,
+            CreatedAt = DateTime.Now,
+            UpdatedAt = DateTime.Now
+        };
+    }
+
+    private static User CreateUser(string email, params Url[] urls)
+    {
+        var user = new User
+        {
+            Email = email,
+            UserName = email
+        };
+        user.Urls.AddRange(urls);
+        return user;
+    }
+
+    private sealed class TestShortenController : ShortenController
+    {
+        private readonly Queue<string> _generatedIds;
+
+        public TestShortenController(
+            IUserHelper userHelper,
+            IUrlRepository urlRepository,
+            IAccessLogRepository accessLogRepository,
+            IDeviceInfoHelper deviceInfoHelper,
+            IGeoHelper geoLocationHelper,
+            IMapper mapper,
+            IEnumerable<string> generatedIds)
+            : base(userHelper, urlRepository, accessLogRepository,
+                deviceInfoHelper, geoLocationHelper, mapper)
+        {
+            _generatedIds = new Queue<string>(generatedIds);
+        }
+
+        protected override string GenerateShortUrlId()
+        {
+            return _generatedIds.Dequeue();
+        }
+    }
+
+    private sealed class FakeUrlRepository : IUrlRepository
+    {
+        private readonly List<Url> _urls;
+
+        public FakeUrlRepository(params Url[] urls)
+        {
+            _urls = [.. urls];
+        }
+
+        public HashSet<string> ExistingShortIds { get; } = [];
+        public IReadOnlyList<Url> Urls => _urls;
+        public Url? AddedUrl { get; private set; }
+        public int UpdateCount { get; private set; }
+        public int RedirectLookupCount { get; private set; }
+
+        public Task<Url?> GetByIdAsync(string id) =>
+            Task.FromResult(_urls.FirstOrDefault(url => url.Id == id));
+
+        public Task<IEnumerable<Url>> GetAllAsync() =>
+            Task.FromResult<IEnumerable<Url>>(_urls);
+
+        public Task AddAsync(Url entity)
+        {
+            AddedUrl = entity;
+            _urls.Add(entity);
+            return Task.CompletedTask;
+        }
+
+        public Task UpdateAsync(Url entity)
+        {
+            UpdateCount++;
+            return Task.CompletedTask;
+        }
+
+        public Task DeleteAsync(Url entity)
+        {
+            _urls.Remove(entity);
+            return Task.CompletedTask;
+        }
+
+        public Task<Url?> FindByShortUrl(string shortUrl) =>
+            Task.FromResult(_urls.FirstOrDefault(url =>
+                url.ShortId == shortUrl));
+
+        public Task<Url?> FindRedirectTargetByShortUrl(string shortUrl)
+        {
+            RedirectLookupCount++;
+            return Task.FromResult(_urls.FirstOrDefault(url =>
+                url.ShortId == shortUrl));
+        }
+
+        public Task<Url?> FindByLongUrl(string lonUrl) =>
+            Task.FromResult(_urls.FirstOrDefault(url =>
+                url.LongUrl == lonUrl));
+
+        public Task<bool> ShortIdExistsAsync(string shortId) =>
+            Task.FromResult(ExistingShortIds.Contains(shortId) ||
+                            _urls.Any(url => url.ShortId == shortId));
+
+        public Task<IEnumerable<Url>> GetTopUrlsAsync() =>
+            Task.FromResult<IEnumerable<Url>>(_urls
+                .OrderByDescending(url => url.AccessLogs.Count)
+                .Take(5));
+    }
+
+    private sealed class FakeAccessLogRepository : IAccessLogRepository
+    {
+        public List<AccessLog> Logs { get; } = [];
+
+        public Task<AccessLog?> GetByIdAsync(string id) =>
+            Task.FromResult(Logs.FirstOrDefault(log => log.Id == id));
+        public Task<IEnumerable<AccessLog>> GetAllAsync() =>
+            Task.FromResult<IEnumerable<AccessLog>>(Logs);
+        public Task AddAsync(AccessLog entity)
+        {
+            Logs.Add(entity);
+            return Task.CompletedTask;
+        }
+        public Task UpdateAsync(AccessLog entity) => Task.CompletedTask;
+        public Task DeleteAsync(AccessLog entity)
+        {
+            Logs.Remove(entity);
+            return Task.CompletedTask;
+        }
+    }
+
+    private sealed class NullGeoHelper : IGeoHelper
+    {
+        public Task<LocationModel?> GetCountryAsync(string ipAddress,
+            CancellationToken cancellationToken = default) =>
+            Task.FromResult<LocationModel?>(null);
+    }
+
+    private sealed class FakeUserHelper(User? user) : IUserHelper
+    {
+        public int UpdateCount { get; private set; }
+        public int RedirectLookupCount { get; private set; }
+
+        public Task<bool> CreateUserAsync(User newUser, string password) =>
+            throw new NotSupportedException();
+        public Task<string> GenerateEmailConfirmationTokenAsync(User user) =>
+            throw new NotSupportedException();
+        public Task<IdentityResult> ConfirmEmailAsync(User user, string token) =>
+            throw new NotSupportedException();
+        public Task<string> GeneratePasswordResetTokenAsync(User user) =>
+            throw new NotSupportedException();
+        public Task<IdentityResult> ResetPasswordAsync(User user, string token,
+            string password) => throw new NotSupportedException();
+        public Task<SignInResult> LoginAsync(string modelEmail,
+            string modelPassword, bool modelRememberMe) =>
+            throw new NotSupportedException();
+        public Task LogoutAsync() => throw new NotSupportedException();
+        public Task<IdentityResult> UpdateUserAsync(User updatedUser)
+        {
+            UpdateCount++;
+            return Task.FromResult(IdentityResult.Success);
+        }
+        public Task<IdentityResult> UpdateSecurityStampAsync(User userToUpdate) =>
+            Task.FromResult(IdentityResult.Success);
+        public Task<IdentityResult> ChangePasswordAsync(User user,
+            string oldPassword, string newPassword) =>
+            throw new NotSupportedException();
+        public Task<bool> CheckPasswordAsync(User user, string password) =>
+            throw new NotSupportedException();
+        public Task<IdentityResult> DeleteUserAsync(User userToDelete) =>
+            throw new NotSupportedException();
+        public Task<User?> FindUserByEmailAsync(string email) =>
+            Task.FromResult(user?.Email == email ? user : null);
+        public Task<User?> FindUserByIdAsync(string id) =>
+            Task.FromResult(user?.Id == id ? user : null);
+        public Task<User?> FindUserByEmailIncludeUrlsAsync(string email) =>
+            Task.FromResult(user?.Email == email ? user : null);
+    }
+}

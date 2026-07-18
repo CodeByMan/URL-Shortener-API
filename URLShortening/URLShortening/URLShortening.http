@@ -1,0 +1,71 @@
+@URLShortening_HostAddress = http://localhost:5229
+@Email = user@example.com
+@Password = Password123!
+@ConfirmationCode = 123456
+@ShortCode = replace-with-a-short-code
+@AccessToken = replace-with-a-jwt-access-token
+
+GET {{URLShortening_HostAddress}}/
+Accept: application/json
+
+### Register
+POST {{URLShortening_HostAddress}}/api/v1/auth/register
+Content-Type: application/json
+
+{
+  "email": "{{Email}}",
+  "password": "{{Password}}"
+}
+
+### Resend confirmation code
+POST {{URLShortening_HostAddress}}/api/v1/auth/resend-confirmation
+Content-Type: application/json
+
+{
+  "email": "{{Email}}"
+}
+
+### Confirm email
+POST {{URLShortening_HostAddress}}/api/v1/auth/confirmemail
+Content-Type: application/json
+
+{
+  "email": "{{Email}}",
+  "confirmationCode": "{{ConfirmationCode}}"
+}
+
+### Login
+POST {{URLShortening_HostAddress}}/api/v1/auth/login
+Content-Type: application/json
+
+{
+  "email": "{{Email}}",
+  "password": "{{Password}}"
+}
+
+### Create an authenticated link
+POST {{URLShortening_HostAddress}}/api/v1/shorten
+Authorization: Bearer {{AccessToken}}
+Content-Type: application/json
+
+{
+  "url": "https://example.com",
+  "expiresAt": null
+}
+
+### Public redirect (returns HTTP 302 when valid)
+GET {{URLShortening_HostAddress}}/api/v1/shorten/{{ShortCode}}
+
+### Authenticated URL details
+GET {{URLShortening_HostAddress}}/api/v1/shorten/{{ShortCode}}/details
+Authorization: Bearer {{AccessToken}}
+Accept: application/json
+
+### Authenticated analytics
+GET {{URLShortening_HostAddress}}/api/v1/shorten/{{ShortCode}}/stats
+Authorization: Bearer {{AccessToken}}
+Accept: application/json
+
+### Logout and invalidate issued tokens for this user
+POST {{URLShortening_HostAddress}}/api/v1/auth/logout
+Authorization: Bearer {{AccessToken}}
